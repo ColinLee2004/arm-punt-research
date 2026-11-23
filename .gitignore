@@ -1,0 +1,8 @@
+# Local Codex project context (kept out of Git)
+/AGENTS.md
+/RESEARCH_PLAN.md
+/.r-library/
+/.r-cache/
+__pycache__/
+*.py[cod]
+.Rhistory

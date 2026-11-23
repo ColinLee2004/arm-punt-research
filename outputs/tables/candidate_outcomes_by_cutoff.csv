@@ -1,0 +1,5 @@
+cutoff_air_yards,eligible_n,valued_n,n_completion_touchdown,n_turnover,n_incomplete_then_punt,n_completion_converts,n_offensive_penalty_as_incomplete,pct_completion_touchdown,pct_turnover,pct_incomplete_then_punt,pct_completion_converts,pct_offensive_penalty_as_incomplete
+25,489,485,26,33,312,117,1,0.0532,0.0675,0.638,0.2393,0.002
+30,294,290,13,18,192,70,1,0.0442,0.0612,0.6531,0.2381,0.0034
+35,187,183,11,14,123,39,,0.0588,0.0749,0.6578,0.2086,
+40,118,115,7,11,79,21,,0.0593,0.0932,0.6695,0.178,

@@ -1,0 +1,5 @@
+cutoff_air_yards,eligible_n,valued_n,unvalued_n,mean_delta_net_points,game_bootstrap_95ci_low,game_bootstrap_95ci_high,game_clusters,positive_delta_share,unvalued_branch_counts
+25,489,485,4,1.7671,1.5331,2.0167,378,0.3052,"{""turnover"": 4}"
+30,294,290,4,1.7695,1.4609,2.0919,250,0.2966,"{""turnover"": 4}"
+35,187,183,4,1.7985,1.358,2.2175,164,0.2896,"{""turnover"": 4}"
+40,118,115,3,1.6832,1.155,2.244,106,0.2696,"{""turnover"": 3}"

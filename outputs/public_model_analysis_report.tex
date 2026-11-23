@@ -1,0 +1,194 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{hyperref}
+\usepackage{amsmath}
+\usepackage{enumitem}
+\usepackage{microtype}
+
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue,citecolor=blue}
+\setlength{\parskip}{0.55em}
+\setlength{\parindent}{0pt}
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+
+\title{Public-Model Arm-Punt Analysis\\\large Methods, Calculations, Results, and Limitations}
+\author{Arm Punt Analytics}
+\date{November 21, 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This report documents the public-model analysis comparing a deep, charted-contested third-down pass (an ``arm punt'') with throwing the ball away and punting. Candidate eligibility requires that a hypothetical zero-yard result leave a fourth-down state in which public \code{nfl4th} selects punt in more than 50\% of its 200 bootstrap draws. A multinomial model predicts outcome probabilities; separate conditional models predict outcome-state distributions; resulting states are valued with public \code{nflfastR} expected points. At the primary 30-air-yard cutoff, the estimated difference is +1.380 EP (game-bootstrap 95\% interval: +1.009 to +1.644; 194 plays) in the all-seasons scope and +1.484 EP (+1.132 to +1.752; 153 plays) using completed seasons only. The separate short-completion fourth-down branch had no observed cases.
+\end{abstract}
+
+\section{Research question and scope}
+
+The estimand is the league-average difference in expected net points between attempting an eligible deep contested pass and throwing the ball away, followed by a punt:
+\[
+  \Delta EV(X) = EV_{\text{arm punt}}(X) - EV_{\text{throwaway punt}}(X).
+\]
+Positive values favor the pass. Both strategies are valued from the original offense's perspective. The analysis is observational: it standardizes values over observed contested-pass situations and does not estimate a causal effect of changing a quarterback's decision.
+
+The implementation follows the project plan's public-model choice. It does not fit a project-local EP model. It estimates outcome probabilities and conditional outcome-state values as separate components, then combines them with public EP. The study is league-wide: no team, quarterback, receiver, punter, or return-unit identity effects are fit. Team labels used to satisfy model interfaces and join game records are not predictors.
+
+The packaged data are the only analysis inputs. The runner reads \code{data/third_down_passes_2022_onward.csv}, \code{data/punt_plays_2022_onward.csv}, and the row counts in \code{data/manifest.json}; it does not connect to the parent repository or an RDS database. Seasons 2022--2025 are complete; 2026 is partial.
+
+\section{Eligible plays and outcome coding}
+
+The third-down pass file was first labeled with mutually exclusive play outcomes. Eligible plays were actual pass attempts with finite air yards, excluding sacks and quarterback scrambles, and with either FTN's retrospective contested-ball flag or a qualifying defensive pass-interference record. A qualifying DPI has a penalty type containing ``pass interference,'' the defensive team as the assessed team, and the source's first-down-penalty flag. This is the available operational definition of the penalty branch; the input is retrospective charting and does not record the quarterback's private expectation.
+
+The primary depth cutoff is 30 air yards, selected in the research plan. Cutoffs 25, 35, and 40 are sensitivity analyses. The data audit found 24,647 third-down pass rows: 3,765 charted contested, 20,860 charted not contested, and 22 with a missing contested flag. Of the 3,765 eligible contested-or-qualifying-DPI rows, 370 distinct fourth-down states at 25 or more air yards were evaluated under a hypothetical zero-yard result; 279 plays passed the punt filter. Filtered counts at 25, 30, 35, and 40 air yards were 279, 194, 137, and 92. The input row counts matched the manifest for both pass and punt files.
+
+Outcome assignment gives priority to offensive penalties, then qualifying defensive DPI, interception (including an interception-return touchdown subtype), fumble lost to the defense, passing touchdown, converting completion, short completion, and incomplete pass. The model's observed outcome classes at the primary cutoff were:
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+Outcome & Count & Share \\
+\midrule
+Completion, converts & 50 & 25.77\% \\
+Completion touchdown & 6 & 3.09\% \\
+Incomplete & 123 & 63.40\% \\
+Interception & 15 & 7.73\% \\
+\midrule
+Total & 194 & 100.00\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+There were no short completions, offensive penalties, completion fumbles, or interception-return touchdowns in this filtered primary sample. For retained situations, the zero-yard state passes the fourth-down punt filter, so incompletions are valued as followed by a punt. A throwaway is modeled as a guaranteed incompletion with no grounding penalty and no change to the line of scrimmage.
+
+\section{Neutral public EP valuation}
+
+Every possession state used by the strategy valuation is passed to \code{nflfastR::calculate_expected_points}. For each state, the runner sets season 2025 (the latest complete season in the package), quarter 1, 900 seconds remaining in the quarter, 3 timeouts for each side, outdoor conditions, field position, down, and yards to go. The runner uses fixed NYJ/HOU labels in the public model's input interface, with NYJ as the modeled offense; no team-specific term is fit. EP is offense-relative, so states belonging to the opponent are sign-reversed when expressed from the original offense's perspective. Touchdown paths include the seven-point score and the opposing side's expected points after the score.
+
+Own-yard-line coordinates are used for derived state calculations: \(\text{own yard line}=100-\texttt{yardline\_100}\). A completed pass's spot uses total yards gained from the line of scrimmage, not air yards alone. A converting completion is valued at the resulting first-down state. A touchdown path is valued as 7 points minus the receiving opponent's EP at its post-score own-25 state. Interception EP uses the separately estimated return and pick-location distribution described below; defensive fumble recovery uses the recorded next-drive own-yard line when that possession transition is available. Opponent EP is negated to retain the original offense's perspective. DPI is valued at the enforced spot as a new first-and-distance state.
+
+The neutral EP check at fourth-and-5 from the offense's own 50 produced 0.13146 expected points. EP is distinct from win probability; it is not a probability that a team wins or that an option is selected.
+
+\section{Punt value and throwaway value}
+
+The punt model pools outcomes across the league and does not use punter, kicking-team, or return-team identity. It starts from \code{data/punt_plays_2022_onward.csv} and the recorded following-drive team and own-yard-line information. The runner represents receiving-team return touchdowns as a seven-point concession less the original offense's post-score EP; a touchdown return by the punting team is valued as seven points less the opponent's post-score EP. For a normal receiving-team possession, punt value is the negative of public EP at the receiving team's resulting own-yard line. A retained possession is valued from the original offense's perspective without reversing the sign.
+
+The punt-value tree predicts from the punt's starting own-yard line. For a candidate at own-yard-line coordinate \(x\), the training tree assigns \(x\) to a terminal leaf; the empirical distribution of that leaf's finite offense-relative punt values is the conditional punt-value distribution, and its mean is used as the candidate's punt EP. Of 9,966 punt attempts, 9,364 had a finite resulting value; 602 lacked usable possession/value information. The throwaway strategy uses the conditional punt value at the candidate's original line of scrimmage. The tree is refit within each training fold and game-bootstrap replicate.
+
+\section{Separate outcome-probability and conditional-value models}
+
+The predictor vector contains only pre-play features: air yards, yards to go, and own-yard-line position. Each is centered and scaled using the training sample's mean and standard deviation. Outcome probabilities are estimated with a regularized multinomial logistic regression (\code{nnet::multinom}, weight decay 0.5, maximum 1,000 iterations). If a fold contains fewer than two outcome classes, the implementation falls back to that training fold's class proportions.
+
+For each outcome category, the analysis separately estimates a conditional empirical distribution of result variables. Other outcome states use kernel-weighted candidate plays at a distance in the three standardized pre-play features. Interception-return and completion-YAC distributions use the same shallow regression-tree architecture trained on league-wide pass plays, rather than only the eligible arm-punt subset. The interception tree uses 1,558 clean returns with a known defensive possession transition, finite return length, no return touchdown, and no penalty. The completion tree uses 54,077 completions with finite air yards and YAC and no penalty. Both trees use target air yards and the offense's own-yard-line position as predictors; down and distance are omitted under the stated assumption that they do not affect return length or YAC. Each tree uses at most three split levels, a 25-play minimum leaf size, and a 60-play minimum split size. Plays assigned to the same terminal leaf receive equal weight and form that leaf's empirical distribution. Interception pick-location offsets remain paired with their return lengths. For a completion, predicted total gain is target air yards plus a leaf donor's YAC, and the distribution is restricted to gains consistent with the modeled converting or short-completion category before the resulting state is valued.
+
+Punt values are estimated with the same tree architecture, using punt starting own-yard line as the predictor and 9,364 punts with finite resulting EP value. A leaf's observed outcome values form the conditional punt-value distribution. The public EP valuation is applied to each recorded punt outcome before the leaf distribution is integrated.
+
+For an interception donor, the opponent's own-yard line at the pick is derived as the recorded opponent next-drive own-yard line minus the recorded interception-return yards. The target's projected spot is \(100-(\text{offense own-yard line}+\text{air yards})\), clamped to the field. The difference between the derived pick spot and that projected target spot is the donor's pick-location offset. For a prediction, the conditional donor offset is applied to the target's projected spot, then the conditional donor return length is added to obtain the opponent's predicted starting position. This models uncertainty in both where the pass is intercepted relative to the target and how far the defense returns it; it does not assume every interception occurs exactly at the target. Other donor outcome measurements, such as completion yards or penalty yards, are also applied to the target pre-play state. The public EP model scores the resulting predicted states, and conditional weights integrate those scores into expected EP. This is direct weighted integration over predicted conditional states, not a fitted parametric distribution or an average of each donor play's original EP. The situation-level predictor also reports the weighted interception-return mean, quartiles, and probabilities of a nonpositive return and a return of at least 20 yards.
+
+For target state \(X_i\), the arm-punt expected value is then calculated as
+\[
+  \widehat{EV}_{\text{arm punt}}(X_i)
+  = \sum_k \widehat{P}(Y=k\mid X_i)\,
+    \widehat{E}[V\mid Y=k,X_i].
+\]
+The strategy difference is this quantity minus the local throwaway-punt value at the same starting line. Thus outcome probabilities and outcome-conditional distributions are distinct estimated components; their combination is a probability-weighted expectation. As distributional diagnostics, the runner also records observed counts, missingness, means, and quartiles for completion yards, yards after catch, interception-return yards, penalty yards, and next-drive own-yard line by outcome at the primary cutoff.
+
+\subsection{Path values by outcome}
+
+\begin{itemize}[leftmargin=*]
+  \item Incompletion and offensive penalty: conditional punt-tree value at the original line of scrimmage.
+  \item Converting completion: public EP at the completed-pass spot, first down, and capped first-down distance.
+  \item Completion touchdown: 7 minus public EP at the opponent's post-score own-25 state.
+  \item Accepted defensive DPI: public EP at the penalty-enforcement spot, first down.
+  \item Interception: predict a conditional return-length and pick-location-offset pair, construct the opponent's post-return own-yard line, and take negative public EP there. If a predicted return reaches the goal line, apply the seven-point defensive touchdown adjustment. Defensive fumble recovery uses the recorded next-drive state.
+  \item Non-converting completion: use the public fourth-down rule described below. This branch had no observed cases in the analyzed candidate samples.
+\end{itemize}
+
+\section{Public fourth-down model and bootstrap rule}
+
+For arm-punt eligibility, the calculation evaluates a hypothetical zero-yard third-down result: fourth down at the same line to gain and field position. It calls \code{nfl4th::add_4th_probs(..., bootstrap=TRUE)} and compares go, field-goal, and punt values for 200 game-bootstrap fits. The shipped fit is excluded from the 200-draw majority calculation. A draw counts as punt-best when the punt value is finite and exceeds both go and field-goal values. A missing punt value counts as not selecting punt. A candidate passes only when
+\[
+  \frac{\#\{\text{bootstrap draws in which punt ranks best}\}}{200} > 0.50.
+\]
+When this share exceeds 50\%, the state is retained as a valid arm-punt opportunity. Its throwaway baseline uses the conditional league punt value at the unchanged line of scrimmage. The same majority rule separately values any actual non-converting completion using its resulting fourth-down state. \code{punt_wp} itself is not treated as the probability that the model chooses to punt; the comparison is made across option values within each bootstrap draw.
+
+To remove matchup-strength effects from the \code{nfl4th} interface, the project-local schedule cache adds a neutral 2025 regular-season fixture with zero point spread, equal 22-point team totals, and outdoor conditions. The model state is tied, in Q1 with 15:00 remaining and three timeouts per side. The fourth-and-5 check from the own 50 returned 200 bootstrap draws and punt-best share 0.01. The filter applies to candidate eligibility; there were no observed non-converting completion states at cutoffs 25 yards or deeper, so the separate short-completion valuation branch had no cases. The decision table records the evaluated zero-gain states and short-completion states; the verification table records the warm-up check.
+
+\section{Uncertainty and temporal validation}
+
+For each scope and cutoff, the game-cluster bootstrap samples the unique game IDs with replacement, keeping all eligible plays from each sampled game together. It uses 100 replicates. The random seed is based on 20261121 and offset by cutoff and the number of candidate rows. In each replicate, the outcome-probability, interception-return, completion-YAC, and punt-value models are refit on in-bag games and evaluated on games absent from that draw (out-of-bag games). Public EP and public \code{nfl4th} remain fixed. The mean finite held-out difference is recorded; the interval is the empirical 2.5th and 97.5th percentiles of those replicate means.
+
+Temporal validation holds out one season at a time (2022, 2023, 2024, 2025, and partial 2026), trains the outcome-probability, interception-return, completion-YAC, and punt-value models on all other seasons, and predicts the held-out season. The primary candidate-level values and strategy estimates use these season-held-out predictions; the completed-season estimate trains each fold on the other complete seasons only. Outcome-probability diagnostics are log loss and multiclass Brier score. The report's mean metrics are an unweighted average of the five season-level metrics. Per-season outcome calibration and held-out strategy-difference summaries are in \code{outputs/tables/season_heldout_calibration.csv} and \code{outputs/tables/season_heldout_validation.csv}.
+
+\section{Results}
+
+The 30-yard cutoff is primary; all other cutoffs were declared sensitivities. Each row below averages over the observed eligible candidate states in that scope. All candidates in these result rows received a finite arm-punt and throwaway valuation.
+
+\begin{center}
+\small
+\begin{tabular}{llrrrrrr}
+\toprule
+Scope & Cutoff & Eligible & Arm EP & Throwaway EP & Difference & \multicolumn{2}{c}{OOB 95\% interval} \\
+ & (yd) & \(n\) & & & & Low & High \\
+\midrule
+2022--2026, incl. partial & 25 & 279 & 0.224 & -1.077 & 1.301 & 1.075 & 1.516 \\
+2022--2026, incl. partial & 30 & 194 & 0.311 & -1.069 & 1.380 & 1.009 & 1.644 \\
+2022--2026, incl. partial & 35 & 137 & 0.296 & -1.069 & 1.365 & 0.987 & 1.630 \\
+2022--2026, incl. partial & 40 & 92 & 0.275 & -1.032 & 1.307 & 0.787 & 1.642 \\
+Completed 2022--2025 & 25 & 222 & 0.331 & -1.096 & 1.427 & 1.160 & 1.735 \\
+Completed 2022--2025 & 30 & 153 & 0.392 & -1.093 & 1.484 & 1.132 & 1.752 \\
+Completed 2022--2025 & 35 & 105 & 0.391 & -1.090 & 1.481 & 1.007 & 1.784 \\
+Completed 2022--2025 & 40 & 69 & 0.306 & -1.030 & 1.336 & 0.780 & 1.857 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+At the primary cutoff, the cross-season predicted result is +1.380 expected points in the all-seasons scope and +1.484 in completed seasons only. The out-of-bag interval is positive for both scopes and all listed cutoffs. These are predictive, standardized estimates for observed eligible states; selection into observed contested passes and the fourth-down filter remains a limitation.
+
+Season-held-out outcome-probability metrics averaged across the five held-out seasons were:
+\begin{center}
+\begin{tabular}{rrr}
+\toprule
+Air-yard cutoff & Mean log loss & Mean multiclass Brier score \\
+\midrule
+25 & 0.999 & 0.539 \\
+30 & 1.004 & 0.526 \\
+35 & 0.997 & 0.532 \\
+40 & 0.988 & 0.519 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Interpretation and limitations}
+
+\begin{enumerate}[leftmargin=*]
+  \item The data contain a selected set of observed deep contested attempts, not randomized arm-punt decisions. The model predicts outcome categories and conditional result states for held-out plays, then calculates their EP. The estimates are not causal effects or a recommendation for a particular team or quarterback.
+  \item The primary estimate is averaged over observed eligible states. This run does not solve the research plan's full \(\Delta EV(X)=0\) boundary over a target-depth, distance-to-go, and field-position grid, nor does it calculate a break-even completion or interception probability. The cutoff sensitivity table is not a decision-threshold surface.
+  \item The 2026 season is partial. Completed-season results are shown separately, but the partial season's coverage may differ from completed years.
+  \item The 602 punts with unusable resulting-value information are excluded from the punt-value tree. The tree's leaf distributions preserve observed outcome spread, but the tree is shallow and its splits optimize conditional mean prediction rather than a distribution-specific loss.
+  \item The out-of-bag game bootstrap refits the outcome-probability, interception-return, completion-YAC, and punt-value models but holds public EP and the public fourth-down model fixed. Its interval therefore does not capture uncertainty from those fixed public components.
+  \item The fourth-down filter reduces the candidate sample to situations where punt is the public model's majority recommendation after zero gain. This is a model-based eligibility criterion; it does not establish that a particular quarterback should attempt the pass. The separate non-converting-completion valuation branch had no observed cases.
+\end{enumerate}
+
+\section{Reproduction files}
+
+The analysis is implemented in \code{scripts/run_public_analysis.R}; \code{scripts/predict_arm_punt.R} accepts a specific third-down situation and reports its predicted values. For example, from the repository root:
+\begin{verbatim}
+Rscript scripts/predict_arm_punt.R --air-yards 35 --yards-to-go 8 --own-yardline 42
+\end{verbatim}
+The public model cache setup is \code{scripts/cache_public_models.R}; package setup is \code{scripts/setup_environment.R}. The generated Markdown summary is \code{outputs/public_model_results.md}. Principal machine-readable outputs include:
+
+\begin{itemize}[leftmargin=*]
+  \item \code{outputs/tables/public_model_strategy_results.csv}: scope- and cutoff-level estimates and bootstrap intervals.
+  \item \code{outputs/tables/public_model_candidate_values.csv}: play-level estimates, differences, and support flags.
+  \item \code{outputs/tables/outcome_probability_predictions.csv} and \code{outputs/tables/outcome_category_rates.csv}: predicted probabilities and observed category frequencies.
+  \item \code{outputs/tables/conditional_outcome_state_distributions.csv}: observed conditional state-variable summaries and missingness.
+  \item \code{outputs/tables/punt_model_coverage.csv}, \code{outputs/tables/interception_return_model_coverage.csv}, and \code{outputs/tables/completion_yac_model_coverage.csv}: usable punt valuations and training coverage for the conditional return/YAC models.
+  \item \code{outputs/tables/season_heldout_validation.csv} and \code{outputs/tables/season_heldout_calibration.csv}: temporal validation diagnostics.
+  \item \code{outputs/tables/fourth_down_decisions.csv} and \code{outputs/tables/public_model_verification.csv}: fourth-down sample coverage and public-model check.
+\end{itemize}
+
+\end{document}

@@ -1,0 +1,49 @@
+{
+  "created_utc": "2026-11-21T17:55:57.201894+00:00",
+  "seasons": [
+    2022,
+    2023,
+    2024,
+    2025,
+    2026
+  ],
+  "season_2026_is_partial": true,
+  "play_by_play_source": "nflverse raw play-by-play parquet (selected source columns, including down/distance, clock, EPA/EP and punt flags)",
+  "charting_source": "FTN charting, joined on nflverse_game_id + nflverse_play_id",
+  "game_drive_crosswalk": "schedule team/week crosswalk, validated against FTN; drives joined on game and fixed_drive",
+  "team_agnostic_analysis": true,
+  "files": {
+    "plays_2022_onward.csv.gz": {
+      "rows": 223756,
+      "bytes": 21174324,
+      "sha256": "14fdbe03b5d3d1959ac23b73ceac4fd9334840f9868177848695535d0f778d7c",
+      "columns": 127
+    },
+    "third_down_passes_2022_onward.csv": {
+      "rows": 24647,
+      "bytes": 20541921,
+      "sha256": "ceb894e439a2d3300d6d74e6a406e65e46cf0180ce55e87894f76e9f09398d55",
+      "columns": 127
+    },
+    "punt_plays_2022_onward.csv": {
+      "rows": 9966,
+      "bytes": 8275397,
+      "sha256": "f654ae00c53fe670987b24534cc8276c4f0533c7c61afd793adf69347f351dce",
+      "columns": 127
+    },
+    "games_2022_onward.csv": {
+      "rows": 1415,
+      "bytes": 256832,
+      "sha256": "f12af537a360264ec293dcf2c9e809248dff45cf8a6013ab8eb0650d3215e5d1",
+      "columns": 27
+    },
+    "drives_2022_onward.csv": {
+      "rows": 28075,
+      "bytes": 3473537,
+      "sha256": "a240427619eea4d148ce3b0915927025d2f2ddf07503afb7644a82ac173ad951",
+      "columns": 24
+    }
+  },
+  "ftn_charting_rows_joined": 210695,
+  "unmapped_play_games": 0
+}

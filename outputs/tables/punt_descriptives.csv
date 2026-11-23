@@ -1,0 +1,13 @@
+metric,n_true,punt_attempts,pct
+blocked,42,9966,0.0042
+fair_catch,2784,9966,0.2793
+downed,1177,9966,0.1181
+out_of_bounds,990,9966,0.0993
+touchback,739,9966,0.0742
+inside_twenty,3869,9966,0.3882
+in_endzone,8,9966,0.0008
+valid_receiving_drive_start_n,9209,9966,0.924
+receiving_start_own_yards_mean,,9209,24.031
+receiving_start_own_yards_median,,9209,21.0
+receiving_start_own_yards_q25,,9209,13.0
+receiving_start_own_yards_q75,,9209,32.0

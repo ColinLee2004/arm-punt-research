@@ -1,0 +1,12 @@
+file,observed_rows,manifest_rows,rows_match_manifest
+third_down_passes_2022_onward.csv,24647,24647,TRUE
+punt_plays_2022_onward.csv,9966,9966,TRUE
+third_down_passes_ftn_contested_true,3765,,
+third_down_passes_ftn_contested_false,20860,,
+third_down_passes_ftn_contested_missing,22,,
+eligible_contested_or_dpi_passes,3765,,
+eligible_contested_or_dpi_passing_zero_gain_punt_filter,279,,
+eligible_cutoff_25_air_yards_and_zero_gain_punt_filter,279,,
+eligible_cutoff_30_air_yards_and_zero_gain_punt_filter,194,,
+eligible_cutoff_35_air_yards_and_zero_gain_punt_filter,137,,
+eligible_cutoff_40_air_yards_and_zero_gain_punt_filter,92,,

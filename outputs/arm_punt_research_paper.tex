@@ -1,0 +1,153 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{amsmath}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{caption}
+\hypersetup{colorlinks=true,linkcolor=black,urlcolor=blue,citecolor=black}
+\setlength{\parskip}{0.55em}
+\setlength{\parindent}{0pt}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+
+\title{Evaluating the Arm Punt\thanks{Analysis code and reproducible result tables are maintained with the project data package.}}
+\author{Colin Lee}
+\date{November 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+On third down, a quarterback facing a long distance to gain may attempt a deep pass into tight coverage rather than throw the ball away and preserve the option to punt. This study estimates the league-average expected-points difference between those strategies using National Football League play-by-play data from 2022 through the partial 2026 season. A regularized multinomial model estimates pass-outcome probabilities, while separate empirical conditional distributions represent the resulting states. League-wide regression trees model interception-return length, completion yards after catch, and punt value. Resulting possession states are evaluated with the public \texttt{nflfastR} expected-points model under a fixed neutral game context. Eligibility also requires that the public \texttt{nfl4th} model select punt on a hypothetical fourth down following a zero-yard third-down result in more than half of 200 bootstrap draws. For charted-contested targets of at least 30 air yards passing this filter, the estimated arm-punt value exceeds the throwaway-and-punt value by 1.380 expected points per attempt (100-replicate game-bootstrap 95\% interval: 1.009 to 1.644; 194 plays). The completed-seasons-only estimate is 1.484 points (153 plays; interval: 1.132 to 1.752). These are predictive standardized comparisons over observed eligible situations, not causal effects or player-specific recommendations. No eligible play produced a non-converting completion, so the separate fourth-down valuation branch for short completions was not used.
+\end{abstract}
+
+\section{Introduction}
+
+The ``arm punt'' is a high-risk third-down pass that can be understood as an alternative to throwing the ball away and punting. The pass may produce a conversion or touchdown, but it can also end in an incompletion or interception. The strategic comparison therefore depends on more than completion probability: it requires valuing the field position and possession state associated with each possible outcome, as well as the punt that follows a throwaway.
+
+Expected points (EP) provide a common scale for comparing football states. Public EP models estimate the points associated with a possession state from factors such as down, distance, and field position; nflfastR provides an implementation that can score user-supplied states \cite{nflfastrEP,Yurko2019}. This study combines that public valuation model with separately estimated outcome probabilities and conditional distributions of play results. It asks: for observed league-wide deep, charted-contested third-down attempts, what is the expected-points difference between attempting the pass and throwing the ball away before punting?
+
+The estimand is
+\begin{equation}
+  \Delta EV(X) = EV_{\mathrm{pass}}(X) - EV_{\mathrm{throwaway+punt}}(X),
+\end{equation}
+where positive values favor the pass and values are measured from the original offense's perspective. The primary cutoff is 30 air yards, selected in the analysis plan before interpreting the results. Cutoffs of 25, 35, and 40 air yards and a completed-seasons-only scope are reported as sensitivity analyses.
+
+\section{Data and study population}
+
+The analysis uses the project's packaged nflverse play-by-play, third-down pass, and punt CSV files. The package contains 223,756 play rows from seasons 2022--2026, with 2026 partial at the time of extraction. The third-down pass file contains 24,647 plays and the punt file contains 9,966 punt attempts; both counts match the package manifest. No external database or team-specific data source is required to reproduce the analysis.
+
+Eligible arm-punt observations are third-down pass attempts with finite air yards at or above the specified cutoff and either a positive FTN charted-contested flag or a qualifying defensive pass-interference penalty. An additional pre-play filter retains a situation only when, after a hypothetical zero-yard result, punt is the best fourth-down option in more than 50\% of \texttt{nfl4th}'s 200 game-bootstrap draws. Of the 294 otherwise-eligible 30-yard attempts, 194 pass this filter. Filtered counts at the 25-, 35-, and 40-yard cutoffs are 279, 137, and 92. Team and player identities are not model predictors. The retrospective charting flag identifies observed contested attempts; it does not measure what a quarterback anticipated before the throw.
+
+At the filtered primary cutoff, 123 plays were incomplete (63.4\%), 50 were completions that gained a first down (25.8\%), six were passing touchdowns (3.1\%), and 15 were interceptions (7.7\%). No short completion, completion fumble, or interception-return touchdown was observed. A throwaway is represented as a guaranteed incompletion with no grounding penalty and no change in the line of scrimmage. For retained situations, this leaves the same fourth-down distance and field position that passed the punt filter, so incompletions and offensive penalties are valued as followed by a punt.
+
+\section{Modeling and valuation}
+
+\subsection{Outcome probabilities}
+
+The outcome model estimates the probability of each mutually exclusive pass outcome from three pre-play features: air yards, yards to go, and the offense's own-yard-line position. These variables are centered and scaled within the training data. A regularized multinomial logistic regression is fit with \texttt{nnet::multinom}, weight decay 0.5, and a maximum of 1,000 iterations. When a training fold contains fewer than two outcome classes, the fold's observed class proportions provide the fallback probabilities. No post-play result, team, or player identity enters this model.
+
+\subsection{Conditional outcome distributions}
+
+Outcome probabilities and conditional result distributions are modeled as separate components. Given a predicted outcome category, its conditional distribution supplies possible result states; each state is valued with public EP before the values are integrated. This preserves the distinction between the probability of an event and the field-position consequences conditional on that event.
+
+Interception-return length and pick-location offset are modeled jointly using a shallow regression tree trained on all eligible league pass plays, not only the arm-punt sample. The model uses target air yards and the offense's own-yard-line position, with down and distance omitted. It has a maximum depth of three, a minimum leaf size of 25, and a minimum split size of 60. The training set contains 1,558 clean interceptions with a known defensive possession transition, finite return length, and no return touchdown or penalty. Plays in a terminal leaf receive equal weight and form an empirical conditional distribution. Return lengths remain paired with their pick-location offsets so uncertainty in the interception point is retained.
+
+Completion yards after catch (YAC) use the same tree architecture and predictors. This model is trained on 54,077 league-wide completions with finite air yards and YAC and no penalty. For a target situation, a donor's predicted total gain is target air yards plus the donor's YAC. The distribution is restricted to results consistent with the modeled completion category, such as a first down for a converting completion, before its resulting state is valued.
+
+Other outcome states use kernel-weighted empirical conditional distributions from comparable candidate plays based on standardized pre-play features. These distributions are integrated over the public EP value of their resulting states rather than reduced to a single donor-play EP value.
+
+\subsection{Punt outcomes and public expected points}
+
+Observed punt outcomes are translated into values from the punting offense's perspective using the receiving possession and resulting field position. The model uses 9,364 punt attempts with finite outcome values; 602 attempts lack sufficient possession/value information. A shallow regression tree conditions the empirical punt-value distribution on the punt's starting own-yard-line position. The conditional mean of the terminal leaf's outcome values supplies the punt value at a candidate state. The tree is refit within each temporal-validation fold and game-bootstrap replicate. No punter, kicking-team, or return-team effects are fit.
+
+Each resulting possession state is scored by \texttt{nflfastR::calculate\_expected\_points} using the latest complete season in the package (2025), Q1 15:00, three timeouts per side, and outdoor conditions. A fixed neutral team matchup is supplied only to satisfy the model interface; it is not an explanatory feature. Opponent-possession EP is sign-reversed to express the value for the original offense. Touchdowns include the subsequent possession value using the public EP model's scoring convention.
+
+For outcome category $k$, the expected pass value is
+\begin{equation}
+  \widehat{EV}_{\mathrm{pass}}(X_i)
+  = \sum_k \widehat{P}(Y=k\mid X_i)
+    \sum_{j=1}^{m_{ik}} w_{ijk}\,V(s_{ijk}),
+\end{equation}
+where $s_{ijk}$ is a possible resulting state from the category's conditional empirical distribution, $w_{ijk}$ is its normalized conditional weight, and $V(\cdot)$ is the public EP valuation. The throwaway-and-punt strategy uses the conditional punt value at the original line of scrimmage. The difference between these values is calculated for each eligible play and then averaged within each analysis scope.
+
+\subsection{Short completions and fourth down}
+
+A hypothetical zero-yard third-down result leaves the offense at fourth down with the original line to gain and field position. Each candidate state is passed to the public \texttt{nfl4th} model under a neutral schedule context, and it is retained as a valid arm-punt situation only when punt is the best option in more than 50\% of 200 game-bootstrap draws. The 25-yard-or-deeper eligible set contains 370 distinct fourth-down states for this filter; 279 plays pass at 25 yards and 194 pass at the primary 30-yard cutoff. This filter excludes situations where the public model more often prefers a field goal or going for it, making the throwaway-followed-by-punt comparison consistent with the defined opportunity. The separate short-completion rule still applies to the fourth-down state after an actual non-converting completion. There were no such completions in the filtered eligible samples, so that branch was not needed to value observed outcomes.
+
+\section{Validation and uncertainty}
+
+Temporal validation holds out one season at a time from 2022 through 2026, fits the data-trained components on other seasons, and predicts the held-out season. The 2026 fold is partial. At the primary cutoff, the mean log loss across the five season folds is 0.986 and the mean multiclass Brier score is 0.540. These metrics summarize categorical probability predictions; they do not by themselves establish calibration or decision utility.
+
+Uncertainty intervals use a game-cluster bootstrap with 100 replicates. Games are resampled as clusters, the outcome-probability and conditional-distribution models are refit on in-bag games, and differences are evaluated on games absent from the draw. The reported interval is the empirical 2.5th and 97.5th percentile of the replicate mean differences. The public EP and \texttt{nfl4th} components remain fixed across replicates, so the interval reflects sampling variability in the data-trained components rather than uncertainty in the public models.
+
+\section{Results}
+
+Table~\ref{tab:results} reports the estimated mean values for both strategies and their difference. In the filtered primary 30-yard sample, the arm-punt strategy has mean value 0.311 EP per attempt, compared with $-1.069$ EP for throwing away and punting. The estimated difference is +1.380 EP (95\% interval: +1.009 to +1.644). All 194 eligible plays received finite valuations. The completed-seasons-only estimate is +1.484 EP (153 plays; 95\% interval: +1.132 to +1.752).
+
+\begin{table}[htbp]
+\centering
+\caption{Strategy values by target-depth cutoff and season scope.}
+\label{tab:results}
+\small
+\begin{tabularx}{\textwidth}{lrrrrrY}
+\toprule
+Scope & Cutoff & $n$ & Arm pass & Throwaway + punt & Difference & 95\% interval \\
+ & (yd) & & (EP) & (EP) & (EP) & \\
+\midrule
+2022--2026, partial & 25 & 279 & 0.224 & $-1.077$ & 1.301 & [1.075, 1.516] \\
+2022--2026, partial & 30 & 194 & 0.311 & $-1.069$ & 1.380 & [1.009, 1.644] \\
+2022--2026, partial & 35 & 137 & 0.296 & $-1.069$ & 1.365 & [0.987, 1.630] \\
+2022--2026, partial & 40 & 92 & 0.275 & $-1.032$ & 1.307 & [0.787, 1.642] \\
+Completed 2022--2025 & 25 & 222 & 0.331 & $-1.096$ & 1.427 & [1.160, 1.735] \\
+Completed 2022--2025 & 30 & 153 & 0.392 & $-1.093$ & 1.484 & [1.132, 1.752] \\
+Completed 2022--2025 & 35 & 105 & 0.391 & $-1.090$ & 1.481 & [1.007, 1.784] \\
+Completed 2022--2025 & 40 & 69 & 0.306 & $-1.030$ & 1.336 & [0.780, 1.857] \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The point estimates are positive at every reported cutoff, and each game-bootstrap interval is above zero. The estimates are similar in direction when partial 2026 is omitted, although intervals widen at higher cutoffs as sample sizes fall. Under the study's neutral EP assumptions and within situations where punt is the model-selected fourth-down action after zero gain, the expected value of the deep contested attempt exceeds that of an immediate throwaway followed by a punt. The size of this advantage should be interpreted alongside the outcome model's temporal performance and the study's sample-selection limits.
+
+\subsection{Illustrative situation}
+
+For a 42-air-yard target on third-and-19 from the offense's own 43-yard line, the zero-gain fourth-down state has a punt-best share of 1.00, so the situation passes the eligibility filter. The updated predictor assigns probabilities of 57.5\% to an incompletion, 22.4\% to a converting completion, 15.4\% to an interception, and 4.7\% to a passing touchdown. The corresponding conditional EP values are $-0.541$, 4.253, $-0.941$, and 5.817. Probability-weighting those values gives 0.772 EP for the arm punt. The predicted punt value at the original line is $-0.541$ EP, yielding an estimated advantage of +1.313 EP for this illustrative state. This is a model-based scenario prediction, not a causal estimate or a player-specific recommendation.
+
+\section{Discussion}
+
+The central analytical result is that a deep contested attempt can have positive expected value relative to preserving a punt, even when incompletions are common. Its value comes from probability-weighted paths that include conversions and touchdowns, balanced against interception risk and the value of the opponent's possession after a turnover. Modeling outcome probabilities separately from conditional result distributions makes those components explicit and lets the analysis value field-position consequences rather than treating each play category as a single average.
+
+The conditional models use the full league play sample for interception returns and completion YAC, which gives those distributions more support than the rare eligible arm-punt sample alone. The trees deliberately omit down and distance for these two outcomes under the assumption that those variables do not affect the return or post-catch gain. Punt distributions are conditioned on starting field position, while team and player identity are excluded throughout. These design choices make the estimates league-wide and reproducible, while leaving room for future model comparison and calibration work.
+
+The results do not identify a universal decision threshold. The reported primary estimate averages across the observed eligible states; it is not a surface over every combination of target depth, distance to go, and field position. Nor does it estimate what would happen if quarterbacks changed their choices in randomized conditions. The data describe attempts that were selected by quarterbacks, play callers, and defensive situations. Differences in play design, coverage, quarterback skill, and unobserved decision context can affect both which passes were attempted and their outcomes.
+
+\section{Limitations}
+
+First, the arm-punt sample is observational and selected both by the contested/depth criteria and the public fourth-down punt filter. The positive estimates should be read as standardized predictive comparisons for observed eligible attempts, not as causal treatment effects. Second, the filtered primary sample contains 194 plays, including 15 interceptions. The conditional interception model draws strength from league-wide plays, but rare tails remain uncertain. Third, the outcome model's cross-season average log loss and Brier score are reported as validation summaries, but further calibration plots and subgroup checks would be useful before applying the model operationally.
+
+Fourth, the public EP and fourth-down models are evaluated under a fixed neutral context. Real game decisions may depend on score, clock, weather, and team strength. Fifth, the bootstrap holds public EP and \texttt{nfl4th} fixed, so intervals do not include uncertainty in those models. Sixth, 602 of 9,966 punts lack sufficient data to calculate the modeled outcome value, and 2026 is partial. The fourth-down filter is applied to candidate eligibility, but no observed non-converting completion activated the separate short-completion continuation branch.
+
+\section{Conclusion}
+
+Using public EP valuation and separately estimated outcome probabilities and conditional distributions, this study finds an estimated +1.380 expected-points advantage for a 30-yard-or-deeper charted-contested third-down pass over throwing away and punting in states where the public fourth-down model recommends a punt after zero gain, with a game-bootstrap 95\% interval from +1.009 to +1.644. The completed-seasons-only estimate is +1.484 EP. The result demonstrates a reproducible way to translate football outcome distributions into a decision-relevant value comparison. It should be interpreted as a league-wide predictive estimate for observed situations, not as causal proof that any individual quarterback should attempt the pass.
+
+\section*{Reproducibility}
+
+The analysis is implemented in \texttt{scripts/run\_public\_analysis.R}; the situation-level scorer is \texttt{scripts/predict\_arm\_punt.R}. Input CSVs, model coverage, bootstrap results, and validation tables are stored in the project repository. The analysis can be reproduced without connecting to the source RDS database. The main result table is in \texttt{outputs/tables/public\_model\_strategy\_results.csv}.
+
+\begin{thebibliography}{9}
+\bibitem{Yurko2019}
+Yurko, R., Ventura, S., and Horowitz, M. (2019). nflWAR: A reproducible method for offensive player evaluation in football. \textit{Journal of Quantitative Analysis in Sports}, 15(3), 163--183. \url{https://doi.org/10.1515/jqas-2018-0010}.
+
+\bibitem{nflfastrEP}
+nflverse. (2026). \textit{Compute expected points: nflfastR reference documentation}. \url{https://nflfastr.com/reference/calculate_expected_points.html}.
+
+\bibitem{nfl4thManual}
+Baldwin, B., and Carl, S. (2026). \textit{nfl4th: Functions to calculate optimal fourth down decisions in the National Football League}. R package reference manual. \url{https://nflverse.r-universe.dev/nfl4th/doc/manual.html}.
+\end{thebibliography}
+
+\end{document}

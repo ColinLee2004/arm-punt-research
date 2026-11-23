@@ -1,0 +1,2 @@
+training_play_states,training_drives,equal_drive_weight_total,weighted_in_sample_rmse,ridge_penalty,context,predictors
+187944,27875,27875.0,2.5742,50.0,"Q1 15:00, tied 0-0, 3 timeouts per side","possession-relative field position, down, yards to go, quarter, clock, score differential, offense/defense timeouts"
