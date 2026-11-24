@@ -1,0 +1,10 @@
+metric,value
+accepted_dpi_records_with_known_target_depth,472
+deep_target_description,249
+deep_and_charted_contested,162
+penalty_yards_observed,472
+penalty_yards_mean,14.9194915254237
+penalty_yards_median,13
+penalty_yards_q25,8
+penalty_yards_q75,20
+accepted_pi_records_excluded_unknown_depth,8

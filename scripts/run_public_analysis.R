@@ -65,6 +65,17 @@ is_dpi <- function(d) {
     as.character(d$penalty_team) == as.character(d$defteam) & flag(d$first_down_penalty)
 }
 
+passer_label_from_desc <- function(desc) {
+  vapply(desc, function(x) {
+    if (is.na(x) || !nzchar(x)) return(NA_character_)
+    before_pass <- strsplit(as.character(x), " pass", fixed = TRUE)[[1L]][1L]
+    player_tokens <- regmatches(before_pass,
+      gregexpr("[0-9]+-[A-Za-z.']+", before_pass, perl = TRUE))[[1L]]
+    if (!length(player_tokens) || identical(player_tokens, "")) return(NA_character_)
+    sub("^[0-9]+-", "", tail(player_tokens, 1L))
+  }, character(1L), USE.NAMES = FALSE)
+}
+
 classify <- function(d) {
   n <- nrow(d)
   out <- rep("other_unresolved", n)
@@ -91,6 +102,99 @@ classify <- function(d) {
   out[complete & !converts & !touchdown & !intercept & !own_pen & !dpi & !fumble_turnover] <- "completion_short"
   out[incomplete & !intercept & !own_pen & !dpi] <- "incomplete"
   out
+}
+
+pass_depth_bucket <- function(d, use_description = FALSE) {
+  n <- nrow(d)
+  depth <- rep(NA_character_, n)
+  if ("pass_length" %in% names(d)) {
+    pl <- tolower(trimws(as.character(d$pass_length)))
+    depth[pl %in% c("short", "deep")] <- pl[pl %in% c("short", "deep")]
+  }
+  air <- if ("air_yards" %in% names(d)) num(d$air_yards) else rep(NA_real_, n)
+  missing <- is.na(depth) & finite(air)
+  # nflverse's pass_length labels align closely with a 15-yard air-depth split.
+  depth[missing] <- ifelse(air[missing] >= 15, "deep", "short")
+  if (use_description && "desc" %in% names(d)) {
+    desc <- ifelse(is.na(d$desc), "", as.character(d$desc))
+    deep <- grepl("pass\\s+(incomplete\\s+)?deep", desc, ignore.case = TRUE, perl = TRUE)
+    short <- grepl("pass\\s+(incomplete\\s+)?short", desc, ignore.case = TRUE, perl = TRUE)
+    depth[is.na(depth) & deep] <- "deep"
+    depth[is.na(depth) & short] <- "short"
+  }
+  depth
+}
+
+contest_bucket <- function(x) {
+  out <- rep("unknown", length(x))
+  out[flag(x)] <- "contested"
+  out[!is.na(x) & !flag(x)] <- "not_contested"
+  out
+}
+
+prepare_penalty_probability_training <- function(plays, passes) {
+  pass_attempt <- flag(passes$pass_attempt) & !flag(passes$sack) & !flag(passes$qb_scramble)
+  controls <- passes[pass_attempt & !flag(passes$penalty), , drop = FALSE]
+  controls$penalty_outcome <- "no_accepted_pi"
+  controls$target_depth <- pass_depth_bucket(controls)
+  controls$contest <- contest_bucket(controls$ftn_is_contested_ball)
+  controls$own_start <- 100 - num(controls$yardline_100)
+
+  pt <- tolower(ifelse(is.na(plays$penalty_type), "", as.character(plays$penalty_type)))
+  team <- as.character(plays$penalty_team)
+  down3 <- num(plays$down) == 3
+  accepted <- flag(plays$penalty) & down3 & as.character(plays$play_type) == "no_play"
+  dpi <- accepted & pt == "defensive pass interference" &
+    team == as.character(plays$defteam) & flag(plays$first_down_penalty)
+  opi <- accepted & pt == "offensive pass interference" &
+    team == as.character(plays$posteam)
+  pi <- plays[dpi | opi, , drop = FALSE]
+  pi$penalty_outcome <- ifelse(dpi[dpi | opi], "accepted_defensive_penalty", "offensive_penalty")
+  pi$target_depth <- pass_depth_bucket(pi, use_description = TRUE)
+  pi$contest <- contest_bucket(pi$ftn_is_contested_ball)
+  pi$own_start <- 100 - num(pi$yardline_100)
+
+  usable <- function(d) !is.na(d$target_depth) & complete.cases(d[, c("ydstogo", "yardline_100", "own_start")])
+  pi_depth_coverage <- do.call(rbind, lapply(c("accepted_defensive_penalty", "offensive_penalty"), function(k) {
+    x <- pi[as.character(pi$penalty_outcome) == k, , drop = FALSE]
+    data.frame(penalty_outcome = k, total_records = nrow(x),
+      deep = sum(x$target_depth == "deep", na.rm = TRUE),
+      short = sum(x$target_depth == "short", na.rm = TRUE),
+      unknown_depth = sum(is.na(x$target_depth)))
+  }))
+  excluded_pi_unknown_depth <- sum(is.na(pi$target_depth))
+  controls <- controls[usable(controls), , drop = FALSE]
+  pi <- pi[usable(pi), , drop = FALSE]
+  controls$season <- num(controls$season)
+  pi$season <- num(pi$season)
+  controls$ydstogo <- num(controls$ydstogo)
+  pi$ydstogo <- num(pi$ydstogo)
+  controls$penalty_yards <- NA_real_
+  controls$first_down_penalty <- FALSE
+  pi$penalty_yards <- num(pi$penalty_yards)
+  model_data <- rbind(
+    controls[, c("game_id", "season", "ydstogo", "own_start", "target_depth", "contest", "penalty_outcome", "penalty_yards", "first_down_penalty")],
+    pi[, c("game_id", "season", "ydstogo", "own_start", "target_depth", "contest", "penalty_outcome", "penalty_yards", "first_down_penalty")]
+  )
+  model_data$penalty_outcome <- factor(model_data$penalty_outcome,
+    levels = c("no_accepted_pi", "accepted_defensive_penalty", "offensive_penalty"))
+  dpi_donors <- pi[as.character(pi$penalty_outcome) == "accepted_defensive_penalty" &
+    finite(pi$penalty_yards) & pi$penalty_yards >= 0 & flag(pi$first_down_penalty), , drop = FALSE]
+  coverage <- data.frame(
+    source_category = c("third_down_pass_attempt_controls", "accepted_third_down_dpi", "accepted_third_down_opi"),
+    records_in_model = c(nrow(controls),
+      sum(as.character(pi$penalty_outcome) == "accepted_defensive_penalty"),
+      sum(as.character(pi$penalty_outcome) == "offensive_penalty")),
+    deep_records = c(sum(controls$target_depth == "deep"),
+      sum(as.character(pi$penalty_outcome) == "accepted_defensive_penalty" & pi$target_depth == "deep"),
+      sum(as.character(pi$penalty_outcome) == "offensive_penalty" & pi$target_depth == "deep")),
+    contested_records = c(sum(controls$contest == "contested"),
+      sum(as.character(pi$penalty_outcome) == "accepted_defensive_penalty" & pi$contest == "contested"),
+      sum(as.character(pi$penalty_outcome) == "offensive_penalty" & pi$contest == "contested"))
+  )
+  list(data = model_data, dpi_donors = dpi_donors, coverage = coverage,
+       pi_rows = pi, pi_depth_coverage = pi_depth_coverage,
+       excluded_pi_unknown_depth = excluded_pi_unknown_depth)
 }
 
 # Insert a project-only neutral matchup into nfl4th's schedule cache. nfl4th's
@@ -367,6 +471,42 @@ completion_conditional_ep <- function(target, completion_tree, outcome, punt_val
   result
 }
 
+defensive_penalty_conditional_ep <- function(target, donors) {
+  result <- rep(NA_real_, nrow(target))
+  if (!nrow(donors)) return(result)
+  donor_depth <- as.character(donors$target_depth)
+  donor_contest <- as.character(donors$contest)
+  donor_own <- num(donors$own_start)
+  donor_togo <- num(donors$ydstogo)
+  donor_yards <- num(donors$penalty_yards)
+  donor_first <- flag(donors$first_down_penalty)
+  donor_ok <- finite(donor_own) & finite(donor_togo) & finite(donor_yards) & donor_yards >= 0 & donor_first
+  if (!any(donor_ok)) return(result)
+  donor_idx <- which(donor_ok)
+  for (i in seq_len(nrow(target))) {
+    target_depth <- if ("target_depth" %in% names(target)) as.character(target$target_depth[i]) else pass_depth_bucket(target[i, , drop = FALSE])
+    target_contest <- if ("contest" %in% names(target)) as.character(target$contest[i]) else {
+      contest_bucket(if ("ftn_is_contested_ball" %in% names(target)) target$ftn_is_contested_ball[i] else NA)
+    }
+    eligible <- donor_idx[donor_depth[donor_idx] == target_depth & donor_contest[donor_idx] == target_contest]
+    if (!length(eligible)) eligible <- donor_idx[donor_depth[donor_idx] == target_depth]
+    if (!length(eligible)) eligible <- donor_idx
+    dx <- cbind(
+      (donor_togo[eligible] - num(target$ydstogo[i])) / max(stats::sd(donor_togo[eligible]), 1),
+      (donor_own[eligible] - num(target$own_start[i])) / max(stats::sd(donor_own[eligible]), 1)
+    )
+    distance <- sqrt(rowSums(dx^2))
+    k <- min(length(distance), max(30L, ceiling(sqrt(length(distance)) * 3)))
+    bandwidth <- max(sort(distance, partial = k)[k], .15)
+    weight <- exp(-.5 * (distance / bandwidth)^2)
+    if (!any(weight > 0)) weight[which.min(distance)] <- 1
+    own_after <- pmin(99, pmax(0, num(target$own_start[i]) + donor_yards[eligible]))
+    values <- ep_state(own_after, 1, pmin(10, pmax(1, 100 - own_after)))
+    result[i] <- sum(weight * values) / sum(weight)
+  }
+  result
+}
+
 neutral_fourth_decisions <- function(short_rows) {
   if (!nrow(short_rows)) return(data.frame(own_after = numeric(), togo_after = numeric(), punt_share = numeric()))
   own_start <- 100 - num(short_rows$yardline_100)
@@ -416,6 +556,78 @@ make_features <- function(d, centers = NULL, scales = NULL) {
   list(z = z, centers = centers, scales = scales)
 }
 
+make_penalty_features <- function(d, centers = NULL, scales = NULL) {
+  depth <- if ("target_depth" %in% names(d)) as.character(d$target_depth) else pass_depth_bucket(d)
+  contest <- if ("contest" %in% names(d)) as.character(d$contest) else {
+    contest_bucket(if ("ftn_is_contested_ball" %in% names(d)) d$ftn_is_contested_ball else rep(NA, nrow(d)))
+  }
+  togo <- num(d$ydstogo)
+  own <- if ("own_start" %in% names(d)) num(d$own_start) else 100 - num(d$yardline_100)
+  if (is.null(centers)) centers <- c(togo = mean(togo, na.rm = TRUE), own = mean(own, na.rm = TRUE))
+  if (is.null(scales)) scales <- c(togo = stats::sd(togo, na.rm = TRUE), own = stats::sd(own, na.rm = TRUE))
+  scales[!finite(scales) | scales == 0] <- 1
+  z <- data.frame(
+    target_depth = factor(depth, levels = c("short", "deep")),
+    contest = factor(contest, levels = c("not_contested", "contested", "unknown")),
+    togo_z = (togo - centers["togo"]) / scales["togo"],
+    own_z = (own - centers["own"]) / scales["own"]
+  )
+  list(z = z, centers = centers, scales = scales)
+}
+
+fit_penalty_probability_model <- function(train) {
+  keep <- !is.na(train$penalty_outcome) & !is.na(train$target_depth) &
+    complete.cases(train[, c("ydstogo", "own_start", "contest")])
+  train <- train[keep, , drop = FALSE]
+  if (!nrow(train)) return(list(model = NULL, classes = character(), prior = numeric(),
+                                centers = c(togo = 0, own = 0), scales = c(togo = 1, own = 1)))
+  fs <- make_penalty_features(train)
+  model_data <- data.frame(penalty_outcome = droplevels(train$penalty_outcome), fs$z)
+  classes <- levels(model_data$penalty_outcome)
+  prior <- prop.table(table(model_data$penalty_outcome))
+  fit <- NULL
+  if (length(classes) >= 2L) {
+    fit <- tryCatch(nnet::multinom(
+      penalty_outcome ~ target_depth + contest + togo_z + own_z,
+      data = model_data, decay = .5, maxit = 1000, trace = FALSE, MaxNWts = 20000
+    ), error = function(e) NULL)
+  }
+  list(model = fit, classes = classes, prior = prior,
+       centers = fs$centers, scales = fs$scales)
+}
+
+predict_penalty_probabilities <- function(fit, target) {
+  classes <- c("no_accepted_pi", "accepted_defensive_penalty", "offensive_penalty")
+  ans <- matrix(0, nrow = nrow(target), ncol = length(classes),
+                dimnames = list(NULL, classes))
+  if (!length(fit$classes)) {
+    ans[, "no_accepted_pi"] <- 1
+    return(ans)
+  }
+  if (is.null(fit$model)) {
+    for (k in intersect(names(fit$prior), classes)) ans[, k] <- as.numeric(fit$prior[k])
+  } else {
+    z <- make_penalty_features(target, fit$centers, fit$scales)$z
+    p <- tryCatch(stats::predict(fit$model, newdata = z, type = "probs"), error = function(e) NULL)
+    if (is.null(p)) {
+      for (k in intersect(names(fit$prior), classes)) ans[, k] <- as.numeric(fit$prior[k])
+    } else if (is.null(dim(p))) {
+      if (nrow(target) == 1L) {
+        if (!is.null(names(p))) for (k in intersect(names(p), classes)) ans[1L, k] <- p[k]
+        else ans[1L, intersect(seq_along(p), seq_along(fit$classes))] <- p
+      } else if (length(fit$classes) == 2L && length(p) == nrow(target)) {
+        ans[, fit$classes[1L]] <- 1 - p
+        ans[, fit$classes[2L]] <- p
+      }
+    } else {
+      for (k in intersect(colnames(p), classes)) ans[, k] <- p[, k]
+    }
+  }
+  rs <- rowSums(ans)
+  ans[rs > 0, ] <- ans[rs > 0, , drop = FALSE] / rs[rs > 0]
+  ans
+}
+
 fit_probability_model <- function(train, centers, scales) {
   train <- train[!is.na(train$outcome) & complete.cases(train[, c("air_yards", "ydstogo", "yardline_100")]), , drop = FALSE]
   classes <- unique(as.character(train$outcome))
@@ -461,6 +673,12 @@ predict_probabilities <- function(fit, target) {
 
 conditional_state_values <- function(target, donors, outcome, centers, scales, punt_values,
                                      fd_decisions, completion_tree = NULL, punt_tree = NULL) {
+  if (outcome == "accepted_defensive_penalty") {
+    return(defensive_penalty_conditional_ep(target, donors))
+  }
+  if (outcome == "offensive_penalty") {
+    return(num(target$throwaway_value))
+  }
   if (outcome %in% c("completion_converts", "completion_short")) {
     return(completion_conditional_ep(target, completion_tree, outcome,
                                     punt_values, punt_tree, fd_decisions))
@@ -488,10 +706,6 @@ conditional_state_values <- function(target, donors, outcome, centers, scales, p
     if (any(is_td)) values[is_td] <- 7 - ep_state(rep(25, sum(is_td)), 1, 10)
   } else if (outcome == "completion_touchdown") {
     values <- rep(7 - ep_state(25, 1, 10), nt * nd)
-  } else if (outcome == "accepted_defensive_penalty") {
-    spot <- pmin(100, pmax(0, target_own + num(donors$penalty_yards[di])))
-    ok <- finite(spot)
-    if (any(ok)) values[ok] <- ep_state(spot[ok], 1, pmin(10, pmax(1, 100 - spot[ok])))
   } else if (outcome %in% c("completion_fumble_lost", "interception_return_td")) {
     is_td <- flag(donors$return_touchdown[di]) &
       as.character(donors$return_team[di]) == as.character(donors$defteam[di])
@@ -538,9 +752,19 @@ conditional_state_values <- function(target, donors, outcome, centers, scales, p
 }
 
 score_model <- function(train, target, centers, scales, punt_values, fd_decisions,
-                        int_train, completion_train) {
+                        int_train, completion_train, penalty_train) {
   fit <- fit_probability_model(train, centers, scales)
-  prob <- predict_probabilities(fit, target)
+  clean_prob <- predict_probabilities(fit, target)
+  penalty_fit <- fit_penalty_probability_model(penalty_train)
+  penalty_prob <- predict_penalty_probabilities(penalty_fit, target)
+  classes <- unique(c(colnames(clean_prob), "accepted_defensive_penalty", "offensive_penalty"))
+  prob <- matrix(0, nrow = nrow(target), ncol = length(classes),
+                 dimnames = list(NULL, classes))
+  for (k in colnames(clean_prob)) {
+    prob[, k] <- clean_prob[, k] * penalty_prob[, "no_accepted_pi"]
+  }
+  prob[, "accepted_defensive_penalty"] <- penalty_prob[, "accepted_defensive_penalty"]
+  prob[, "offensive_penalty"] <- penalty_prob[, "offensive_penalty"]
   int_tree <- fit_conditional_tree(int_train, "int_return_yards", c("air_yards", "own_start"))
   completion_tree <- fit_conditional_tree(completion_train, "yards_after_catch", c("air_yards", "own_start"))
   punt_tree <- fit_conditional_tree(punt_values, "value", "own_start")
@@ -548,7 +772,13 @@ score_model <- function(train, target, centers, scales, punt_values, fd_decision
   missing_support <- rep(FALSE, nrow(target))
   cond <- matrix(NA_real_, nrow(target), ncol(prob), dimnames = list(NULL, colnames(prob)))
   for (k in colnames(prob)) {
-    donors <- train[as.character(train$outcome) == k, , drop = FALSE]
+    if (k == "accepted_defensive_penalty") {
+      donors <- penalty_train[as.character(penalty_train$penalty_outcome) == k, , drop = FALSE]
+    } else if (k == "offensive_penalty") {
+      donors <- penalty_train[as.character(penalty_train$penalty_outcome) == k, , drop = FALSE]
+    } else {
+      donors <- train[as.character(train$outcome) == k, , drop = FALSE]
+    }
     if (k == "interception") {
       cond[, k] <- interception_conditional_ep(target, int_train, int_tree)
     } else {
@@ -565,7 +795,9 @@ score_model <- function(train, target, centers, scales, punt_values, fd_decision
       expected[i] <- sum(prob[i, active] * cond[i, active])
     }
   }
-  list(prob = prob, conditional = cond, expected = expected, missing_support = missing_support, fit = fit)
+  list(prob = prob, clean_prob = clean_prob, penalty_prob = penalty_prob,
+       conditional = cond, expected = expected, missing_support = missing_support,
+       fit = fit, penalty_fit = penalty_fit)
 }
 
 resample_game_rows <- function(d, draw) {
@@ -578,13 +810,14 @@ resample_game_rows <- function(d, draw) {
 }
 
 bootstrap_games <- function(d, punt_values, fd_decisions, int_train, completion_train,
-                            reps = BOOTSTRAPS, seed = SEED) {
+                            penalty_train, reps = BOOTSTRAPS, seed = SEED) {
   set.seed(seed + nrow(d))
   games <- unique(as.character(d$game_id))
   scope_seasons <- unique(num(d$season))
   punt_scope <- punt_values[num(punt_values$season) %in% scope_seasons, , drop = FALSE]
   int_scope <- int_train[num(int_train$season) %in% scope_seasons, , drop = FALSE]
   completion_scope <- completion_train[num(completion_train$season) %in% scope_seasons, , drop = FALSE]
+  penalty_scope <- penalty_train[num(penalty_train$season) %in% scope_seasons, , drop = FALSE]
   out <- numeric()
   if (length(games) < 2L) return(out)
   for (b in seq_len(reps)) {
@@ -598,10 +831,11 @@ bootstrap_games <- function(d, punt_values, fd_decisions, int_train, completion_
     punt_boot <- resample_game_rows(punt_scope, draw)
     int_boot <- resample_game_rows(int_scope, draw)
     completion_boot <- resample_game_rows(completion_scope, draw)
+    penalty_boot <- resample_game_rows(penalty_scope, draw)
     heldout$throwaway_value <- punt_ev_at(heldout$own_start, punt_boot)
     feat <- make_features(boot)
     scored <- score_model(boot, heldout, feat$centers, feat$scales,
-                          punt_boot, fd_decisions, int_boot, completion_boot)
+                          punt_boot, fd_decisions, int_boot, completion_boot, penalty_boot)
     delta <- scored$expected - heldout$throwaway_value
     if (any(finite(delta))) out <- c(out, mean(delta[finite(delta)]))
   }
@@ -609,13 +843,16 @@ bootstrap_games <- function(d, punt_values, fd_decisions, int_train, completion_
 }
 
 season_heldout_validation <- function(d, cutoff, scope_name, punt_values, fd_decisions,
-                                      int_train, completion_train) {
+                                      int_train, completion_train, penalty_train) {
   seasons <- sort(unique(num(d$season)))
   int_scope <- int_train[num(int_train$season) %in% seasons, , drop = FALSE]
   completion_scope <- completion_train[num(completion_train$season) %in% seasons, , drop = FALSE]
+  penalty_scope <- penalty_train[num(penalty_train$season) %in% seasons, , drop = FALSE]
   classes <- sort(unique(as.character(d$outcome)))
-  prob <- matrix(0, nrow(d), length(classes), dimnames = list(NULL, classes))
-  conditional <- matrix(NA_real_, nrow(d), length(classes), dimnames = list(NULL, classes))
+  all_classes <- unique(c(classes, "accepted_defensive_penalty", "offensive_penalty"))
+  prob <- matrix(0, nrow(d), length(all_classes), dimnames = list(NULL, all_classes))
+  clean_prob <- matrix(0, nrow(d), length(classes), dimnames = list(NULL, classes))
+  conditional <- matrix(NA_real_, nrow(d), length(all_classes), dimnames = list(NULL, all_classes))
   expected <- rep(NA_real_, nrow(d))
   throwaway_value <- rep(NA_real_, nrow(d))
   fold <- rep(NA_integer_, nrow(d))
@@ -631,10 +868,12 @@ season_heldout_validation <- function(d, cutoff, scope_name, punt_values, fd_dec
     fs <- make_features(train)
     int_fold <- int_scope[num(int_scope$season) != s, , drop = FALSE]
     completion_fold <- completion_scope[num(completion_scope$season) != s, , drop = FALSE]
+    penalty_fold <- penalty_scope[num(penalty_scope$season) != s, , drop = FALSE]
     scored <- score_model(train, test, fs$centers, fs$scales, punt_fold,
-                          fd_decisions, int_fold, completion_fold)
-    for (k in intersect(colnames(scored$prob), classes)) prob[test_idx, k] <- scored$prob[, k]
-    for (k in intersect(colnames(scored$conditional), classes)) conditional[test_idx, k] <- scored$conditional[, k]
+                          fd_decisions, int_fold, completion_fold, penalty_fold)
+    for (k in intersect(colnames(scored$prob), all_classes)) prob[test_idx, k] <- scored$prob[, k]
+    for (k in intersect(colnames(scored$clean_prob), classes)) clean_prob[test_idx, k] <- scored$clean_prob[, k]
+    for (k in intersect(colnames(scored$conditional), all_classes)) conditional[test_idx, k] <- scored$conditional[, k]
     expected[test_idx] <- scored$expected
     throwaway_value[test_idx] <- test$throwaway_value
     fold[test_idx] <- s
@@ -644,7 +883,7 @@ season_heldout_validation <- function(d, cutoff, scope_name, punt_values, fd_dec
   truth <- matrix(0, length(kept), length(classes), dimnames = list(NULL, classes))
   actual <- as.character(d$outcome[kept])
   truth[cbind(seq_along(kept), match(actual, classes))] <- 1
-  p <- prob[kept, , drop = FALSE]
+  p <- clean_prob[kept, , drop = FALSE]
   p_actual <- pmax(1e-8, p[cbind(seq_along(kept), match(actual, classes))])
   logloss <- -log(p_actual)
   brier <- rowSums((p - truth)^2)
@@ -663,9 +902,39 @@ season_heldout_validation <- function(d, cutoff, scope_name, punt_values, fd_dec
       mean_predicted_probability = mean(p[i, k]))))
   }))
   list(metrics = metrics, calibration = calibration,
-       predicted = list(prob = prob, conditional = conditional, expected = expected,
+       predicted = list(prob = prob, clean_prob = clean_prob, conditional = conditional, expected = expected,
                         throwaway_value = throwaway_value,
                         missing_support = !finite(expected), fold = fold))
+}
+
+penalty_season_heldout_validation <- function(penalty_train) {
+  seasons <- sort(unique(num(penalty_train$season)))
+  classes <- levels(penalty_train$penalty_outcome)
+  out <- list()
+  for (s in seasons) {
+    train <- penalty_train[num(penalty_train$season) != s, , drop = FALSE]
+    test <- penalty_train[num(penalty_train$season) == s, , drop = FALSE]
+    if (!nrow(train) || !nrow(test)) next
+    fit <- fit_penalty_probability_model(train)
+    p <- predict_penalty_probabilities(fit, test)
+    actual <- as.character(test$penalty_outcome)
+    idx <- match(actual, colnames(p))
+    p_actual <- pmax(1e-8, p[cbind(seq_along(idx), idx)])
+    truth <- matrix(0, nrow(test), length(classes), dimnames = list(NULL, classes))
+    truth[cbind(seq_along(actual), match(actual, classes))] <- 1
+    p_full <- p[, classes, drop = FALSE]
+    out[[length(out) + 1L]] <- data.frame(
+      heldout_season = s, n = nrow(test),
+      log_loss = mean(-log(p_actual)),
+      multiclass_brier = mean(rowSums((p_full - truth)^2)),
+      observed_dpi_rate = mean(actual == "accepted_defensive_penalty"),
+      predicted_dpi_rate = mean(p_full[, "accepted_defensive_penalty"]),
+      observed_opi_rate = mean(actual == "offensive_penalty"),
+      predicted_opi_rate = mean(p_full[, "offensive_penalty"])
+    )
+  }
+  if (!length(out)) return(data.frame())
+  do.call(rbind, out)
 }
 
 write_csv <- function(d, name) data.table::fwrite(d, file.path(TABLES, name), na = "")
@@ -685,6 +954,8 @@ main <- function() {
   raw_passes <- passes
   int_return_train <- prepare_interception_return_training(plays)
   completion_yac_train <- prepare_completion_yac_training(plays)
+  penalty_training <- prepare_penalty_probability_training(plays, raw_passes)
+  penalty_model_cv <- penalty_season_heldout_validation(penalty_training$data)
   manifest <- jsonlite::fromJSON(file.path(DATA, "manifest.json"), simplifyVector = FALSE)
 
   passes$outcome <- classify(passes)
@@ -710,6 +981,60 @@ main <- function() {
   passes$ydstogo <- num(passes$ydstogo)
   passes$yardline_100 <- num(passes$yardline_100)
   passes$outcome <- factor(passes$outcome)
+
+  # Throwaways cannot satisfy the primary charted-contested definition. For a
+  # descriptive comparison only, add FTN-flagged throwaways with 30+ air yards
+  # and apply the same pre-play zero-gain punt filter.
+  throwaway_review_base <- pass_attempt & deep &
+    num(raw_passes$air_yards) >= PRIMARY_CUTOFF &
+    (flag(raw_passes$ftn_is_contested_ball) | is_dpi(raw_passes) |
+       flag(raw_passes$ftn_is_throw_away))
+  throwaway_review_rows <- which(throwaway_review_base)
+  extra_throwaway_rows <- which(throwaway_review_base & flag(raw_passes$ftn_is_throw_away) &
+    !eligible_base)
+  extra_throwaway_states <- raw_passes[extra_throwaway_rows, , drop = FALSE]
+  extra_throwaway_states$yards_gained <- 0
+  extra_throwaway_decisions <- if (length(extra_throwaway_rows)) {
+    neutral_fourth_decisions(extra_throwaway_states)
+  } else {
+    zero_gain_decisions[0, , drop = FALSE]
+  }
+  throwaway_review_decisions <- unique(rbind(zero_gain_decisions, extra_throwaway_decisions))
+  review_keys <- paste(round(100 - num(raw_passes$yardline_100[throwaway_review_rows]), 2),
+    round(num(raw_passes$ydstogo[throwaway_review_rows]), 2), sep = "|")
+  review_decision_idx <- match(review_keys, throwaway_review_decisions$key)
+  review_punt_share <- throwaway_review_decisions$punt_share[review_decision_idx]
+  throwaway_review_keep <- !is.na(review_decision_idx) & review_punt_share > .5
+  throwaway_review <- raw_passes[throwaway_review_rows[throwaway_review_keep], , drop = FALSE]
+  throwaway_review$passer_label <- passer_label_from_desc(throwaway_review$desc)
+  throwaway_review$zero_gain_punt_share <- review_punt_share[throwaway_review_keep]
+  throwaway_review$ftn_throwaway <- flag(throwaway_review$ftn_is_throw_away)
+  throwaway_review$regular_incomplete <- flag(throwaway_review$incomplete_pass) &
+    !throwaway_review$ftn_throwaway
+  throwaway_review$analysis_outcome <- as.character(classify(throwaway_review))
+  throwaway_review$own_yardline <- 100 - num(throwaway_review$yardline_100)
+  throwaway_review <- throwaway_review[order(throwaway_review$season,
+    throwaway_review$game_id, throwaway_review$nflverse_play_id), , drop = FALSE]
+  throwaway_review_summary <- data.frame(
+    metric = c("qualifying_deep_punt_eligible_plays", "primary_contested_or_dpi_plays",
+      "ftn_flagged_throwaways", "regular_incompletions", "all_incompletions",
+      "unparsed_passer_labels"),
+    value = c(nrow(throwaway_review), sum(flag(throwaway_review$ftn_is_contested_ball) |
+      is_dpi(throwaway_review)), sum(throwaway_review$ftn_throwaway),
+      sum(throwaway_review$regular_incomplete), sum(flag(throwaway_review$incomplete_pass)),
+      sum(is.na(throwaway_review$passer_label)))
+  )
+  qb_groups <- split(which(!is.na(throwaway_review$passer_label)),
+    throwaway_review$passer_label[!is.na(throwaway_review$passer_label)])
+  throwaway_qb_counts <- do.call(rbind, lapply(names(qb_groups), function(qb) {
+    idx <- qb_groups[[qb]]
+    data.frame(passer_label = qb, qualifying_plays = length(idx),
+      throwaways = sum(throwaway_review$ftn_throwaway[idx]),
+      throwaway_share = mean(throwaway_review$ftn_throwaway[idx]))
+  }))
+  throwaway_qb_counts <- throwaway_qb_counts[throwaway_qb_counts$throwaways > 0, , drop = FALSE]
+  throwaway_qb_counts <- throwaway_qb_counts[order(-throwaway_qb_counts$throwaways,
+    -throwaway_qb_counts$throwaway_share, throwaway_qb_counts$passer_label), , drop = FALSE]
 
   manifest_rows <- function(name) as.numeric(manifest$files[[name]]$rows)
   audit <- data.frame(
@@ -749,6 +1074,35 @@ main <- function() {
     value = c(nrow(completion_yac_train), mean_or_na(completion_yac_train$yards_after_catch),
               q_or_na(completion_yac_train$yards_after_catch, .5))
   ), "completion_yac_model_coverage.csv")
+  write_csv(penalty_training$coverage, "penalty_model_training_coverage.csv")
+  write_csv(penalty_training$pi_depth_coverage, "accepted_pi_target_depth_coverage.csv")
+  write_csv(penalty_model_cv, "penalty_model_season_heldout_validation.csv")
+  write_csv(throwaway_review_summary, "arm_punt_throwaway_summary.csv")
+  write_csv(throwaway_qb_counts, "arm_punt_throwaway_quarterback_counts.csv")
+  throwaway_review_columns <- c("season", "game_date", "game_id", "nflverse_play_id",
+    "passer_label", "posteam", "air_yards", "ydstogo", "own_yardline",
+    "zero_gain_punt_share", "ftn_is_contested_ball", "ftn_is_throw_away",
+    "incomplete_pass", "regular_incomplete", "analysis_outcome", "desc")
+  write_csv(throwaway_review[, throwaway_review_columns, drop = FALSE],
+    "arm_punt_throwaway_situations.csv")
+  pi_audit_cols <- intersect(c("season", "game_id", "nflverse_play_id", "down", "ydstogo",
+    "yardline_100", "posteam", "defteam", "play_type", "pass_attempt", "air_yards",
+    "penalty", "penalty_type", "penalty_team", "penalty_yards", "first_down_penalty",
+    "ftn_is_contested_ball", "target_depth", "contest", "penalty_outcome", "desc"),
+    names(penalty_training$pi_rows))
+  write_csv(penalty_training$pi_rows[, pi_audit_cols, drop = FALSE], "accepted_pi_training_rows.csv")
+  penalty_dpi <- penalty_training$dpi_donors
+  write_csv(data.frame(
+    metric = c("accepted_dpi_records_with_known_target_depth", "deep_target_description",
+      "deep_and_charted_contested", "penalty_yards_observed", "penalty_yards_mean",
+      "penalty_yards_median", "penalty_yards_q25", "penalty_yards_q75",
+      "accepted_pi_records_excluded_unknown_depth"),
+    value = c(nrow(penalty_dpi), sum(penalty_dpi$target_depth == "deep"),
+      sum(penalty_dpi$target_depth == "deep" & penalty_dpi$contest == "contested"),
+      sum(finite(penalty_dpi$penalty_yards)), mean_or_na(penalty_dpi$penalty_yards),
+      q_or_na(penalty_dpi$penalty_yards, .5), q_or_na(penalty_dpi$penalty_yards, .25),
+      q_or_na(penalty_dpi$penalty_yards, .75), penalty_training$excluded_pi_unknown_depth)
+  ), "accepted_dpi_distribution_coverage.csv")
 
   punt_values <- punt_event_values(punts)
   punt_values$game_id <- punts$game_id
@@ -807,13 +1161,13 @@ main <- function() {
       cand$own_start <- 100 - num(cand$yardline_100)
 
       cv <- season_heldout_validation(cand, cutoff, scope_name, scope_punt_values,
-        fd_decisions, int_return_train, completion_yac_train)
+        fd_decisions, int_return_train, completion_yac_train, penalty_training$data)
       scored <- list(prob = cv$predicted$prob, conditional = cv$predicted$conditional,
                      expected = cv$predicted$expected, missing_support = cv$predicted$missing_support)
       throwaway_value <- cv$predicted$throwaway_value
       delta <- scored$expected - throwaway_value
       boot <- bootstrap_games(cand, scope_punt_values, fd_decisions,
-                              int_return_train, completion_yac_train,
+                              int_return_train, completion_yac_train, penalty_training$data,
                               reps = BOOTSTRAPS, seed = SEED + cutoff)
       ci <- if (length(boot)) stats::quantile(boot, c(.025, .975), na.rm = TRUE) else c(NA, NA)
 
@@ -873,7 +1227,12 @@ main <- function() {
   results <- do.call(rbind, result_rows)
   write_csv(results, "public_model_strategy_results.csv")
   write_csv(do.call(rbind, cand_outputs), "public_model_candidate_values.csv")
-  write_csv(rbind_fill(prob_outputs), "outcome_probability_predictions.csv")
+  probability_predictions <- rbind_fill(prob_outputs)
+  write_csv(probability_predictions, "outcome_probability_predictions.csv")
+  penalty_probability_cols <- c("scope", "cutoff", "game_id", "nflverse_play_id",
+                                "accepted_defensive_penalty", "offensive_penalty")
+  write_csv(probability_predictions[, penalty_probability_cols, drop = FALSE],
+            "penalty_outcome_probability_predictions.csv")
   write_csv(rbind_fill(conditional_outputs), "conditional_expected_path_values.csv")
   write_csv(do.call(rbind, dist_outputs), "outcome_category_rates.csv")
   write_csv(do.call(rbind, cv_metric_outputs), "season_heldout_validation.csv")
@@ -915,7 +1274,7 @@ main <- function() {
   report <- c(
     "# Public-model arm-punt analysis", "",
     "## Method", "",
-    "The primary estimate uses third-down pass attempts with at least 30 air yards, FTN charted contested status or qualifying defensive pass interference, and a pre-play fourth-down filter. For each candidate situation, nfl4th evaluates a hypothetical zero-yard result (4th down at the same line and distance); the situation is retained only when punt is best in more than 50% of 200 game-bootstrap fits. Cutoffs 25, 35, and 40 are reported as sensitivities. Outcome probabilities are fit with a regularized multinomial logistic model using only air yards, yards to go, and field position. Interception-return and completion-YAC distributions use the same shallow regression-tree architecture trained on all eligible league pass plays, with target depth and own-yard-line position as predictors; down and distance are omitted from these conditional models. The training observations in each terminal leaf form an empirical outcome distribution, retaining paired interception pick-location offsets and return lengths. Punt values use a separate tree conditioned on punt starting own-yard line. Other outcome states use kernel-weighted empirical conditional distributions from comparable candidate plays. Predicted states are evaluated with public EP and combined with outcome probabilities. All data-trained components are held out by season. No player or team identity predictors are used.", "",
+    "The primary estimate uses third-down pass attempts with at least 30 air yards, FTN charted contested status or qualifying defensive pass interference, and a pre-play fourth-down filter. For each candidate situation, nfl4th evaluates a hypothetical zero-yard result (4th down at the same line and distance); the situation is retained only when punt is best in more than 50% of 200 game-bootstrap fits. Cutoffs 25, 35, and 40 are reported as sensitivities. Clean pass-outcome probabilities are estimated with a regularized multinomial logistic model using air yards, yards to go, and field position. A separate regularized multinomial model estimates no accepted PI, accepted DPI, and accepted OPI probabilities from target depth, charted-contest status, distance to go, and field position. Its training data combines third-down pass-attempt controls with accepted third-down PI no-play records recovered from full PBP; the PI audit and depth coverage tables document the source coding. The resulting mixture assigns accepted DPI and OPI their own probability mass; clean pass outcomes are weighted by the no-accepted-PI probability. DPI conditional enforcement yards are drawn from observed first-down DPI records matched by target depth and contest status, with local weighting by field position and distance. DPI states are valued as a first down from the enforced spot. OPI follows the pre-declared primary assumption of a declined/equivalent incompletion followed by punt. Interception-return and completion-YAC distributions use the same shallow regression-tree architecture trained on all eligible league pass plays, with target depth and own-yard-line position as predictors; down and distance are omitted from these conditional models. The training observations in each terminal leaf form an empirical outcome distribution, retaining paired interception pick-location offsets and return lengths. Punt values use a separate tree conditioned on punt starting own-yard line. Other outcome states use kernel-weighted empirical conditional distributions from comparable candidate plays. Predicted states are evaluated with public EP and combined with outcome probabilities. All data-trained components are held out by season. No player or team identity predictors are used.", "",
     "Every predicted possession state is evaluated with nflfastR's public EP model at Q1 15:00, three timeouts, outdoor, using the latest complete season (2025). Punt outcomes are first mapped to offense-relative public EP values; the conditional punt-value distribution is estimated from the terminal leaf of the punt-starting-position tree. For retained candidates, incompletions and offensive penalties are valued as followed by a punt, consistent with the zero-gain fourth-down filter. A non-converting completion is evaluated at its actual fourth-down state with nfl4th; punt is used when it is best in more than half of 200 game-bootstrap fits. Otherwise, public EP at the fourth-down state is the continuation value.", "",
     "## Results", "",
     "| Scope | Air-yard cutoff | Eligible | Valued | Mean arm-punt EP | Mean throwaway-punt EP | Mean difference | Game-bootstrap 95% interval |", "|---|---:|---:|---:|---:|---:|---:|---:|"
@@ -926,6 +1285,30 @@ main <- function() {
       r$scope, r$air_yard_cutoff, r$eligible_n, r$valued_n, r$mean_arm_punt_ep,
       r$mean_throwaway_punt_ep, r$mean_delta_ep, r$game_bootstrap_95ci_low, r$game_bootstrap_95ci_high))
   }
+  report <- c(report, "", "## Throwaways in the qualifying screen", "",
+    sprintf("The strict primary 30-air-yard sample contains %d charted-contested or DPI-qualified plays; %d were FTN-flagged throwaways. For a descriptive comparison across 2022--2026 (with 2026 partial), a supplemental screen adds FTN-flagged throwaways at 30 or more recorded air yards and applies the same zero-gain fourth-down punt filter. This expanded screen has %d plays: %d FTN-flagged throwaways, %d regular incompletions, and %d total incompletions. Passer labels are abbreviated names parsed from the play descriptions because the packaged data has no structured passer-name field. The eight flagged plays came from eight quarterbacks, one each; the selected-sample denominators are small and should not be read as stable quarterback tendencies.",
+      throwaway_review_summary$value[throwaway_review_summary$metric == "primary_contested_or_dpi_plays"],
+      sum(throwaway_review$ftn_throwaway & (flag(throwaway_review$ftn_is_contested_ball) | is_dpi(throwaway_review))),
+      throwaway_review_summary$value[throwaway_review_summary$metric == "qualifying_deep_punt_eligible_plays"],
+      throwaway_review_summary$value[throwaway_review_summary$metric == "ftn_flagged_throwaways"],
+      throwaway_review_summary$value[throwaway_review_summary$metric == "regular_incompletions"],
+      throwaway_review_summary$value[throwaway_review_summary$metric == "all_incompletions"]),
+    "", "| Quarterback label | Screened plays | FTN throwaways | Share |", "|---|---:|---:|---:|")
+  for (i in seq_len(nrow(throwaway_qb_counts))) {
+    r <- throwaway_qb_counts[i, ]
+    report <- c(report, sprintf("| %s | %d | %d | %.1f%% |", r$passer_label,
+      r$qualifying_plays, r$throwaways, 100 * r$throwaway_share))
+  }
+  report <- c(report, "", "> **Suggested future application:** \"The FTN throwaway flag separates deliberate disposal from ordinary incompletions. In this expanded screen, eight 30-plus-air-yard, punt-eligible attempts were flagged as throwaways, with one occurrence for each of eight quarterbacks. These plays are leads for reviewing pressure, receiver separation, and film to ask whether a downfield option was available; the data alone do not show that a receiver was open or that a throw would have been preferable.\"", "",
+    "The recorded air yards on a throwaway do not necessarily identify an intended target or a viable receiver option. Row-level details and quarterback counts are in `arm_punt_throwaway_situations.csv` and `arm_punt_throwaway_quarterback_counts.csv`.")
+  report <- c(report, "", "## Pass-interference model", "",
+    "Accepted PI is recovered from full play-by-play no-play rows rather than the pass-attempt extract. The probability model uses 21,820 no-penalty third-down pass controls, 472 depth-known accepted DPI records, and 86 depth-known accepted OPI records. Four DPI and four OPI records have unknown target depth and are excluded from fitting. The accepted-DPI conditional distribution contains 472 enforced-yard observations (mean 14.92; median 13; 25th/75th percentiles 8/20). Held-out penalty probabilities average 0.110 log loss and 0.047 multiclass Brier score.",
+    "", "| Held-out season | Plays | Observed DPI rate | Predicted DPI rate | Observed OPI rate | Predicted OPI rate |", "|---:|---:|---:|---:|---:|---:|")
+  for (i in seq_len(nrow(penalty_model_cv))) {
+    r <- penalty_model_cv[i, ]
+    report <- c(report, sprintf("| %d | %d | %.3f | %.3f | %.3f | %.3f |", r$heldout_season, r$n,
+      r$observed_dpi_rate, r$predicted_dpi_rate, r$observed_opi_rate, r$predicted_opi_rate))
+  }
   cv_all <- do.call(rbind, cv_metric_outputs)
   cv_means <- aggregate(cbind(log_loss, multiclass_brier) ~ cutoff, data = cv_all, FUN = mean)
   report <- c(report, "", "## Season-held-out validation", "",
@@ -934,7 +1317,7 @@ main <- function() {
   for (i in seq_len(nrow(cv_means))) report <- c(report, sprintf("| %d | %.3f | %.3f |", cv_means$cutoff[i], cv_means$log_loss[i], cv_means$multiclass_brier[i]))
   report <- c(report, "", "## Limits", "",
     "The observed arm-punt sample is selected and small, so these estimates are predictive standardized associations, not causal effects. Point estimates are held-out predictions: each play's season was excluded from fitting its outcome-probability, interception-return, completion-YAC, and punt-value models. The 100-replicate game bootstrap resamples training games and evaluates out-of-bag games; all data-trained conditional trees are refit on in-bag plays/punts, while public EP and nfl4th remain fixed. There were no observed non-converting completions at the analyzed 25-yard-or-deeper cutoffs, so nfl4th's >50% punt rule did not change those strategy estimates; its neutral 4th-and-5 bootstrap check is in `public_model_verification.csv`.", "",
-    "Detailed tables are in `outputs/tables/`: strategy results, candidate-level values, outcome probabilities, conditional expected path values, category rates, observed conditional outcome-state summaries, interception-return, completion-YAC, and punt-model coverage, fourth-down decisions, and public-model verification.")
+    "Penalty modeling coverage, accepted-PI records, target-depth recovery, penalty branch predictions, and season-held-out penalty probability validation are reported in `penalty_model_training_coverage.csv`, `accepted_pi_training_rows.csv`, `accepted_pi_target_depth_coverage.csv`, `accepted_dpi_distribution_coverage.csv`, `penalty_outcome_probability_predictions.csv`, and `penalty_model_season_heldout_validation.csv`. Detailed tables are in `outputs/tables/`: strategy results, candidate-level values, combined outcome probabilities, separate penalty probabilities, conditional expected path values, category rates, observed conditional outcome-state summaries, interception-return, completion-YAC, and punt-model coverage, fourth-down decisions, and public-model verification.")
   writeLines(report, file.path(OUT, "public_model_results.md"), useBytes = TRUE)
   cat("Wrote public-model results and tables to outputs/.\n")
   print(results)

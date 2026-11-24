@@ -54,6 +54,7 @@ passes <- read_csv(file.path(DATA, "third_down_passes_2022_onward.csv"))
 punts <- read_csv(file.path(DATA, "punt_plays_2022_onward.csv"))
 int_return_train <- prepare_interception_return_training(plays)
 completion_yac_train <- prepare_completion_yac_training(plays)
+penalty_training <- prepare_penalty_probability_training(plays, passes)
 passes$outcome <- classify(passes)
 pass_attempt <- flag(passes$pass_attempt) & !flag(passes$sack) & !flag(passes$qb_scramble)
 eligible <- pass_attempt & finite(num(passes$air_yards)) &
@@ -61,7 +62,12 @@ eligible <- pass_attempt & finite(num(passes$air_yards)) &
 candidate_rows <- which(eligible & num(passes$air_yards) >= PRIMARY_CUTOFF)
 candidate_states <- passes[candidate_rows, , drop = FALSE]
 candidate_states$yards_gained <- 0
-candidate_decisions <- neutral_fourth_decisions(candidate_states)
+decision_cache <- file.path(TABLES, "fourth_down_decisions.csv")
+if (file.exists(decision_cache)) {
+  candidate_decisions <- read_csv(decision_cache)
+} else {
+  candidate_decisions <- neutral_fourth_decisions(candidate_states)
+}
 candidate_keys <- paste(round(100 - num(candidate_states$yardline_100), 2),
                         round(num(candidate_states$ydstogo), 2), sep = "|")
 candidate_decision_idx <- match(candidate_keys, candidate_decisions$key)
@@ -92,19 +98,26 @@ if (!nrow(target_zero) || target_zero$punt_share[[1L]] <= .5) {
 }
 short_rows <- train[num(train$air_yards) >= min(CUTOFFS) &
   as.character(train$outcome) == "completion_short", , drop = FALSE]
-fd_decisions <- unique(rbind(candidate_decisions, neutral_fourth_decisions(short_rows)))
+if (!file.exists(decision_cache)) {
+  candidate_decisions <- unique(rbind(candidate_decisions,
+                                      neutral_fourth_decisions(short_rows)))
+}
+fd_decisions <- unique(candidate_decisions)
 
 target <- data.frame(
   air_yards = air_yards,
   ydstogo = ydstogo,
   yardline_100 = 100 - own_yardline,
   own_start = own_yardline,
+  pass_length = if (air_yards >= 15) "deep" else "short",
+  ftn_is_contested_ball = TRUE,
   throwaway_value = throwaway_ep
 )
 feature_scale <- make_features(train)
 prediction <- score_model(train, target, feature_scale$centers,
                           feature_scale$scales, punt_values, fd_decisions,
-                          int_return_train, completion_yac_train)
+                          int_return_train, completion_yac_train,
+                          penalty_training$data)
 if (!finite(prediction$expected[[1L]])) {
   stop("The model could not value at least one outcome category with predicted probability above zero.")
 }
